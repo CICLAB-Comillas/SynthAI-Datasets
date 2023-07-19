@@ -1,10 +1,10 @@
 import argparse
 import json
 import time
-import os
+from os.path import dirname, join, abspath, exists
 from retry import retry
 from random import choice, randint
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from math import ceil
 
 import datetime
@@ -17,62 +17,63 @@ from rich.live import Live
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.rule import Rule
 
-from secret_key import get_API_KEY
+from prompt import generate_prompt
+from completion import process_completion, ResponseFormatException
+
+# Path of the current file
+FILE_DIR = dirname(abspath(__file__))
 
 ### ----------------------------------ARGUMENTS---------------------------------------------
 
-# Path of the current file
-FILE_PATH = os.path.dirname(os.path.abspath(__file__))
-
-### Arguments
 parser = argparse.ArgumentParser()
 
 # API Key
-parser.add_argument('-k','--api_key', help='OpenAI API key', default=get_API_KEY())
+parser.add_argument('-k','--api_key', help='OpenAI API key')
 
-# Number of calls to generate
-parser.add_argument('-n', '--num_iter',help='Number of calls to generate', type= int, required=True)
+# Number of data samples to generate
+parser.add_argument('-n', '--samples',help='Number of data samples to generate', type= int, required=True)
 
 # Path of the CSV file
-parser.add_argument('-p','--path', help='Path to save the CSV file generated', default=os.path.join(FILE_PATH,"dataset.csv"))
+parser.add_argument('-p','--path', help='Output CSV Path. By default output CSV is generated at this file level (same directory)', default=join(FILE_DIR,"dataset.csv"))
 
-# Path of the JSON file with the call parameters
-parser.add_argument('-j','--json', help='Path of the JSON file with the call parameters', default=os.path.join(FILE_PATH,"params.json"))
+# Path of the JSON file with the parameters
+parser.add_argument('-j','--json', help='Path of prompt parameters JSON', default=join(FILE_DIR,"params.json"))
 
 # Number of batches
 parser.add_argument('-b','--batches', help='Number of batches', type=int, default=1)
 
-# Expenditure limit
-parser.add_argument('-l','--limit', help='Expenditure limit', type=float, default=None)
+# Budget limit
+parser.add_argument('-l','--limit', help='Budget limit for dataset generation', type=float, default=None)
+
+# Dataset generation metrics flag (Default==True -> saves metrics as .csv, "--no-m"==False -> no metrics)
+parser.add_argument("-m","--save_metrics", help="Creates a .csv with the synthetic dataset generation metrics (`prompt_tokens`,`completion_tokens`,`total_tokens`,`time`,`sample`,`batch`)", action=argparse.BooleanOptionalAction, default=True)
 
 args = parser.parse_args()
 
 openai.api_key = args.api_key
-N_CALLS = args.num_iter
+SAMPLES = args.samples
 CSV_PATH = args.path
 JSON_PATH = args.json
-N_BATCHES = args.batches
-N_BATCHES = N_BATCHES if N_CALLS>=N_BATCHES else 1
-EXPENDITURE_LIMIT = args.limit 
+BATCHES = args.batches
+BATCHES = BATCHES if SAMPLES>=BATCHES else 1
+BUDGET_LIMIT = args.limit 
+METRICS = args.save_metrics
 
 CSV_PATH_METRICS = CSV_PATH.replace(".csv","_metrics.csv")
 
-WAIT_TIME_AFTER_CALL_ERROR_SEC = 5 #segundos
+### ---------------------- OpenAI Params & prices -------------------------------------------
 
 API_PRICE_INPUT_1K_TOKENS = 0.0015 #$
 API_PRICE_OUTPUT_1K_TOKENS = 0.002 #$
 
 ### ----------------------------------EXCEPTIONS---------------------------------------------
-class ResponseFormatException(Exception):
-    """Error in the API response format"""
-    pass
 
-class ExpenditureLimitReached(Exception):
-    """Controls the expenditure limit"""
+class BudgetLimitReached(Exception):
+    """Controls the budget limit"""
 
-    def __init__(self, expenditure_limit):
-        self.expenditure_limit = expenditure_limit
-        self.msg = f"${self.expenditure_limit} limit reached."
+    def __init__(self, budget_limit):
+        self.budget_limit = budget_limit
+        self.msg = f"${self.budget_limit} limit reached."
         super().__init__(self.msg)
 
 ### ----------------------------------FUNCTIONS---------------------------------------------
@@ -81,11 +82,18 @@ class ExpenditureLimitReached(Exception):
 with open(JSON_PATH, 'r') as f:
     PARAMS = json.load(f)
 
-def divide_in_batches(n_calls: int, n_batches: int) -> List[int]:
-    calls_per_batch = n_calls // n_batches  # Computes the integer division
-    remainder = n_calls % n_batches  # Computes the remainder of the division (modulo operator)
+def distribute_in_samples(total_samples: int, batches: int) -> List[int]:
+    """ Tries to equally distribute the total samples in the number of indicated batches. Args:
+        * `total_samples`: Total number of samples
+        * `batches`: Number of output batches
 
-    batches = [calls_per_batch] * n_batches  # Creates a list with the quotient repeated n_batches times
+        Returns a List with the amount of samples asigned to each batch. Output list len is always equal to `batches`.
+    """
+
+    samples_per_batch = total_samples // batches  # Computes the integer division
+    remainder = total_samples % batches  # Computes the remainder of the division (modulo operator)
+
+    batches = [samples_per_batch] * batches  # Creates a list with the quotient repeated BATCHES times
 
     # Distributes the remainder in the batches
     for i in range(remainder):
@@ -93,192 +101,114 @@ def divide_in_batches(n_calls: int, n_batches: int) -> List[int]:
 
     return batches
 
-def generate_random_phone_number() -> str:
-    return f"+34 {randint(6e8,75e7-1)}" # With Spain's prefix
-
-def generate_random_call_params() -> str:
-    """ Returns a dictionary with a random value chosen for each parameter """
-    call_params = {}
-    # Random parameters
-    for param in PARAMS["Call"]:
-        call_params[param] = choice(PARAMS["Call"][param])
-        
-    # Fixed parameters
-    call_params['Phone'] = generate_random_phone_number()
-    call_params['Address'] = "Calle de la cuesta 15" # Random/Invented
-    call_params['Company'] = "Company"
-    return call_params
-
-def generate_random_params_summary() -> Dict[str, str]:
-    """ Returns a dictionary with a random value chosen for each parameter """
-    summary_params = {}
-
-    # Random parameters
-    for param in PARAMS["Summary"]:
-        summary_params[param] = choice(PARAMS["Summary"][param])
-    
-    return summary_params
-
-def generate_call_prompt(call_params: Dict[str,List[str]] = None) -> str:
-    """ Returns a prompt to generate a call based on certain parameters """
-    call_params = generate_random_call_params() if call_params is None else call_params
-    return f"Generate a {call_params['Conversation']} phone call in which a client with phone number {call_params['Phone']} and address {call_params['Address']}, with a {call_params['Attitude']} attitude, contacts the supplying company {call_params['Company']} to report a problem with {call_params['Problem']}. Finally, the call is {call_params['Solved']} solved {call_params['Manner']}."
-
-def generate_summary_prompt(summary_params: Dict[str, str] = None) -> str:
-    """ Returns a prompt to generate a summary based on certain parameters """
-    summary_params = generate_random_params_summary() if summary_params is None else summary_params
-    return f"Additionally, generate a {summary_params['Extension']} summary of the conversation."
-
-def combine_prompts(call_prompt, summary_prompt) -> str:
-    """ Combines both prompts (call and summary) to save tokens when sending the request to ChatGPT's API """
-    return f"{call_prompt} {summary_prompt}. Before the conversation, include [Conversation] and before the summary include [Summary]."
-
 @retry((APIError, Timeout, RateLimitError, APIConnectionError, ServiceUnavailableError), delay=5, backoff=2, max_delay=1800)
-def send_to_openai(prompt:str):
-    """ Sends a request message as a `prompt` to OpenAI API. Params
+def send_to_openai(prompt: str) -> Dict[str, str] or None:
+    """ Sends a request message with `prompt` body to OpenAI API. Params
         * `prompt`: text input to API
         Returns the API completion (if received).
     """
     completion = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
+        model = "gpt-3.5-turbo",
         messages=[
             {"role": "user", "content": f"{prompt}"}
         ],
         temperature=0.7,
         max_tokens=1024,
     )
-    if 'choices' in completion:
-        return completion
-    else:
-        return None
+
+    return completion if 'choices' in completion else None
     
-def process_completion(completion: str) -> Dict[str, str]:
-    """ Casts the response obtained from ChatGPT's API to a `Dict` object, including also the provided prompt """
-
-    dict_calls = {}
-
-    try:
-        # Obtain the content of the message (call and summary)
-        content = completion.choices[0].message['content']
-
-        # Obtain the Conversation field of the response
-        conversation = content.split('[Conversation]')[1].split('[Summary]')[0].strip()
-        conversation = conversation[1:] if conversation[0] == ':' else conversation
-        conversation = conversation[1:] if conversation[0] == ' ' else conversation
-        dict_calls["Transcription"] = conversation
-
-        # Obtain the Summary field of the response
-        summary = content.split("[Summary]")[1].split("}")[0].strip()
-        summary = summary[1:] if summary[0] == ':' else summary
-        summary = summary[1:] if summary[0] == ' ' else summary
-        dict_calls["Summary"] = summary
-    except IndexError:
-        raise ResponseFormatException()
-
-    # Obtain the usage
-    dict_metrics = dict(completion.usage)
-
-    return (dict_calls, dict_metrics)
-
 @retry(ResponseFormatException, tries=10)
-def send_and_process_response(prompt: str) -> Dict[str, str]:
-    """ Sends a prompt to OpenAI's API and processes the response. args:
-        * prompt: Request prompt
+def send_and_process_response(prompt: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """ Sends a prompt to OpenAI's API and processes the completion (if) received. 
+        If a format error happens while handling response (was not generated correctly with the expected format), rules out this completion and generates a new one. This process is done over and over up to 10 times. 
+        Args:
+        * `prompt`: Request body for completion.
+
+        Returns the processed completion as dictionary as well as the metrics (dict). Output may vary depending on completion processing function.
+        
+        In the case that max number of tries is reached, then it is supposed that either the completion processing function or prompt generation are not as tune as expected (code review recommended).
     """
-    # Request to the API
+
+    # Request to API
     completion = send_to_openai(prompt)
 
-    # Processing the response
-    dict_call, dict_metrics = process_completion(completion)
+    # Processing completion
+    sample_dict = process_completion(completion)
 
-    return (dict_call, dict_metrics)
+    # Get the usage (metrics) from completion response
+    metrics_dict = dict(completion.usage)
 
-def generate_call(df_calls: DataFrame, df_metrics: DataFrame, call: int, batch: int) -> DataFrame:
-    """ Generates a new row in the dataset with the conversation, summary and the type of summary"""
-    # ------------ 1 - Generating random parameters ------------
+    return sample_dict, metrics_dict
+
+def generate_sample(df_samples: DataFrame, sample: int, batch: int,  df_metrics: DataFrame = None) -> DataFrame:
+    """ Generates a new row in the dataset with a new sample. Args:
+        * `df_samples`: Samples DataFrame. New generated sample will be appended last
+        * `sample`: This new sample number over the total
+        * `batch`: Batch of this new sample
+        * `df_metrics`: [Optional] Metrics DataFrame. The metrics of this new sample with be appended last
+    """
+
+    # ------------ Step 1 Building prompt ------------
     # Create task
-    progress_step_batch_id_0 = progress_step_batch.add_task('',action='Generating random parameters...')
+    progress_step_batch_id_0 = progress_step_batch.add_task('',action='Generating prompt...')
 
-    # Random Call parameters
-    call_params = generate_random_call_params()
-
-    # Random Summary parameters
-    summary_params = generate_random_params_summary()
+    # Prompt generation
+    prompt, random_params = generate_prompt(PARAMS)
 
     # Update batch progress
-    progress_step_batch.update(progress_step_batch_id_0, action='[bold green]Random parameters [✔]')
+    progress_step_batch.update(progress_step_batch_id_0, action='[bold green]Prompt Generated[✔]')
     progress_step_batch.stop_task(progress_step_batch_id_0)
 
-    # ------------ 2 - Building prompt ------------
+    # ------------ Step 2 Performing API request ------------
     # Create task
-    progress_step_batch_id_1 = progress_step_batch.add_task('',action='Building prompt...')
+    progress_step_batch_id_1 = progress_step_batch.add_task('',action='Performing OpenAI API request...')
 
-    # Generate Prompt call
-    prompt_call = generate_call_prompt(call_params)
-
-    # Generate Prompt summary
-    prompt_summary = generate_summary_prompt(summary_params)
-
-    # Combine call and summary in one prompt
-    prompt = combine_prompts(prompt_call, prompt_summary)
-
-    # Update batch progress
-    progress_step_batch.update(progress_step_batch_id_1, action='[bold green]Prompt [✔]')
-    progress_step_batch.stop_task(progress_step_batch_id_1)
-
-    # ------------ 3 - Performing API call ------------
-    # Create task
-    progress_step_batch_id_2 = progress_step_batch.add_task('',action='Performing OpenAI API call...')
-
-    # OpenAI API call timer starts
+    # OpenAI API sample timer starts
     init = time.time()
 
-    # API call
-    dict_call, dict_metrics = send_and_process_response(prompt) # Response
+    # API sample
+    sample_dict, metrics_dict = send_and_process_response(prompt) # Response
 
-    # OpenAI API call timer ends
+    # OpenAI API sample timer ends
     elapsed_time = round(time.time()-init, 2)
 
-    # Add the remaining fields
-    for param in list(PARAMS['Call'].keys()):
-        # Add the Call parameter
-        dict_call[param] = call_params[param]
+    # Adds the params randomly selected in each category to the sample dict
+    for category in list(random_params.keys()):
+        # Add the remaining fields
+        sample_dict.update(random_params[category])
+
+    metrics_dict["time"] = elapsed_time # Elapsed time for the request
+    metrics_dict["sample"] = sample
+    metrics_dict["batch"] = batch
+
+    # Create sample row
+    row_sample = pd.Series(sample_dict).to_frame().T
+
+    # Concatenate the new row at the end of the sample Dataframe
+    df_samples = pd.concat([df_samples, row_sample], ignore_index=True)
+
     
-    for param in list(PARAMS['Summary'].keys()):
-        # Add the Summary parameter
-        dict_call[param] = summary_params[param]
-
-    dict_metrics["time"] = elapsed_time # Elapsed time for the request
-    dict_metrics["call"] = call
-    dict_metrics["batch"] = batch
-
-    # Create call row
-    row_call = pd.Series(dict_call).to_frame().T
-
-    # Concatenate the new row at the end of the Call Dataframe
-    df_calls = pd.concat([df_calls, row_call], ignore_index=True)
-
     # Create metrics row
-    row_metrics = pd.Series(dict_metrics).to_frame().T
-    row_metrics = row_metrics.astype(dtype={'prompt_tokens': "int64",'completion_tokens': "int64",'total_tokens': "int64",'time': "float64",'call': "int64",'batch': "int64"})
+    row_metrics = pd.Series(metrics_dict).to_frame().T
+    row_metrics = row_metrics.astype(dtype={'prompt_tokens': "int64",'completion_tokens': "int64",'total_tokens': "int64",'time': "float64",'sample': "int64",'batch': "int64"})
 
     # Concatenate the new row at the end of the Metrics Dataframe
     df_metrics = pd.concat([df_metrics, row_metrics], ignore_index=True)
 
     # Update batch progress
-    progress_step_batch.update(progress_step_batch_id_2, action='[bold green]OPENAI API call[✔]')
-    progress_step_batch.stop_task(progress_step_batch_id_2)
+    progress_step_batch.update(progress_step_batch_id_1, action='[bold green]OpenAI API completion[✔]')
+    progress_step_batch.stop_task(progress_step_batch_id_1)
 
     # Remove task responses
     progress_step_batch.remove_task(progress_step_batch_id_0)
     progress_step_batch.remove_task(progress_step_batch_id_1)
-    progress_step_batch.remove_task(progress_step_batch_id_2)
 
-    return df_calls, df_metrics
+    return df_samples, df_metrics
 
 def save_CSV(df: DataFrame, path: str = CSV_PATH) -> None:
     """ Saves the Dataframe as a CSV file. If the file already exists, it concatenates the new dataframe"""
-    if os.path.exists(path):
+    if exists(path):
         # Read the CSV file and obtain the last index
         df_csv = pd.read_csv(path,sep=";") 
         try:
@@ -298,10 +228,10 @@ def save_CSV(df: DataFrame, path: str = CSV_PATH) -> None:
         # Create the CSV file
         df.to_csv(path, header=True, index=False, index_label="index", sep=';', encoding='utf-8')
 
-def update_remaining_time(elapsed_time: int, completed_calls: int, remaining_calls: int) -> str:
+def update_remaining_time(elapsed_time: int, completed_samples: int, remaining_samples: int) -> str:
     """ Computes the remaining time in the following format hh:mm:ss"""
 
-    time_remaining_sec = remaining_calls*int(elapsed_time/completed_calls) if completed_calls else '-:--:--'
+    time_remaining_sec = remaining_samples*int(elapsed_time/completed_samples) if completed_samples else '-:--:--'
     time_remaining_sec = str(datetime.timedelta(seconds = time_remaining_sec))
 
     return time_remaining_sec
@@ -320,7 +250,7 @@ total_progress = Progress(
     TimeElapsedColumn(),
     TextColumn('remaining time: [bold cyan]{task.fields[name]}'),
     TextColumn('{task.description}'),
-    TextColumn('Spent: [bold red]{task.fields[action]}')
+    TextColumn('Spent: [bold red]{task.fields[accumulated_cost]} [/bold red](limit: {task.fields[limit]})')
 )
 
 # Batch total progress bar
@@ -328,7 +258,7 @@ total_progress_batch = Progress(
     TimeElapsedColumn(),
     TextColumn('[bold blue] Batch {task.fields[name]}'),
     BarColumn(),
-    TextColumn('({task.completed}/{task.total}) calls generated')
+    TextColumn('({task.completed}/{task.total}) samples generated')
 )
 
 # Batch step progress bar
@@ -347,41 +277,45 @@ group = Group(
     progress_step_batch
 )
 
-# Autorender for the bar group
+# Autorender for bar group
 live = Live(group)
 
 if __name__ == "__main__":
 
-    # Balanced distribution of the calls in batches
-    batches = divide_in_batches(N_CALLS,N_BATCHES)
+    # Balanced distribution of the samples in batches
+    batches = distribute_in_samples(SAMPLES,BATCHES)
+
+    _df_samples_columns = list(PARAMS.keys())
+    for param in list(PARAMS.keys()):
+        _df_samples_columns += list(PARAMS[param].keys())
 
     # Create Dataframe
-    df_calls = DataFrame(columns=['Transcription','Summary']+list(PARAMS['Call'].keys())+list(PARAMS['Summary'].keys()))
+    df_samples = DataFrame(columns=_df_samples_columns)
 
-    df_metrics = DataFrame(columns=['prompt_tokens','completion_tokens','total_tokens','time','call','batch'])
+    df_metrics = DataFrame(columns=['prompt_tokens','completion_tokens','total_tokens','time','sample','batch'])
 
     cumulative_cost = 0.0 # Initial cumulative cost
 
     # Total progress task
-    total_progress_id = total_progress.add_task(description=f'[bold #AAAAA](batch {0} of {N_BATCHES})', total=N_CALLS, name = '-:--:--', action="$0.00")
+    total_progress_id = total_progress.add_task(description=f'[bold #AAAAA](batch 0 of {BATCHES})', total=SAMPLES, name = '-:--:--', accumulated_cost="$0.00", limit=BUDGET_LIMIT)
 
     with live:
         try:
             # Process time starts
             initial_time_sec = time.time()
 
-            for batch, calls_batch in enumerate(batches):
+            for batch, samples_batch in enumerate(batches):
                 # Update batch number
-                total_progress.update(total_progress_id, description=f'[bold #AAAAA](batch {batch+1} of {N_BATCHES})')
+                total_progress.update(total_progress_id, description=f'[bold #AAAAA](batch {batch+1} of {BATCHES})')
                 
                 # Create complete batch task
-                total_progress_batch_id = total_progress_batch.add_task('',total=calls_batch, name=batch)
+                total_progress_batch_id = total_progress_batch.add_task('',total=samples_batch, name=batch)
 
-                for call in range(calls_batch):
-                    # Generate call
-                    df_calls, df_metrics = generate_call(df_calls, df_metrics, call, batch)
+                for sample in range(samples_batch):
+                    # Generate sample
+                    df_samples, df_metrics = generate_sample(df_samples, sample, batch, df_metrics)
 
-                    # Update the number of calls
+                    # Update the number of samples
                     total_progress_batch.update(total_progress_batch_id, advance=1)
 
                     # Update the total progress
@@ -389,24 +323,26 @@ if __name__ == "__main__":
 
                     # Update remaining time
                     elapsed_time_sec = int(time.time()-initial_time_sec)
-                    completed_calls = total_progress._tasks[total_progress_id].completed
-                    remaining_calls = N_CALLS - completed_calls
-                    total_progress.update(total_progress_id, name = update_remaining_time(elapsed_time_sec, completed_calls, remaining_calls))
+                    completed_samples = total_progress._tasks[total_progress_id].completed
+                    remaining_samples = SAMPLES - completed_samples
+                    total_progress.update(total_progress_id, name = update_remaining_time(elapsed_time_sec, completed_samples, remaining_samples))
 
                     # Update cost
                     cumulative_cost = compute_cumulative_cost(cumulative_cost, df_metrics.iloc[-1]["prompt_tokens"], df_metrics.iloc[-1]["completion_tokens"])
-                    total_progress.update(total_progress_id, action = f"${ceil(cumulative_cost*100)/100}")
+                    total_progress.update(total_progress_id, accumulated_cost = f"${ceil(cumulative_cost*100)/100}")
 
                     # If the limit is reached, the process is interrumpted
-                    if EXPENDITURE_LIMIT and cumulative_cost > EXPENDITURE_LIMIT:
-                        raise ExpenditureLimitReached(EXPENDITURE_LIMIT)
+                    if BUDGET_LIMIT and cumulative_cost > BUDGET_LIMIT:
+                        raise BudgetLimitReached(BUDGET_LIMIT)
 
-                # Saves Calls Dataframe in a CSV file
-                save_CSV(df_calls.iloc[-calls_batch:])
-                save_CSV(df_metrics.iloc[-calls_batch:], CSV_PATH_METRICS) # Save metrics
+                # Saves samples Dataframe in a CSV file
+                save_CSV(df_samples.iloc[-samples_batch:])
+                if METRICS:
+                    save_CSV(df_metrics.iloc[-samples_batch:], CSV_PATH_METRICS) # Save metrics
 
         except Exception as e: # work on python 3.x
             print(f"An error occurred: {e}")
-            # Saves Calls Dataframe in a CSV file
-            save_CSV(df_calls.iloc[-calls_batch:])
-            save_CSV(df_metrics.iloc[-calls_batch:], CSV_PATH_METRICS)  # Save metrics
+            # Saves samples Dataframe in a CSV file
+            save_CSV(df_samples.iloc[-samples_batch:])
+            if METRICS:
+                save_CSV(df_metrics.iloc[-samples_batch:], CSV_PATH_METRICS)  # Save metrics
