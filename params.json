@@ -1,0 +1,46 @@
+{
+    "Call": {
+        "Attitude": [
+            "positive",
+            "neutral",
+            "negative",
+            "aggresive",
+            "assertive"
+        ],
+        "Conversation": [
+            "long",
+            "brief",
+            "normal"
+        ],
+        "Problem": [
+            "an electricity supply cut off",
+            "a gas supply cut-off",
+            "the meter",
+            "an unexpected charge on the electricity bill",
+            "an unexpected charge on gas bill",
+            "a change of electricity tariff",
+            "a change of gas tariff",
+            "a rate recommendation",
+            "the solar panel installation"
+        ],
+        "Solved": [
+            " ",
+            "not"
+        ],
+        "Manner": [
+            "successfully",
+            "kindly",
+            "patiently",
+            "quickly"
+        ]
+    },
+    "Summary": {
+        "Extension": [
+            "brief",
+            "concise",
+            "extensive",
+            "in depth",
+            "detailed"
+        ]
+    }
+}
