@@ -3,7 +3,6 @@ import json
 import time
 from os.path import dirname, join, abspath, exists
 from retry import retry
-from random import choice, randint
 from typing import Dict, List, Tuple
 from math import ceil
 
