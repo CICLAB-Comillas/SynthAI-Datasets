@@ -250,7 +250,7 @@ total_progress = Progress(
     TimeElapsedColumn(),
     TextColumn('remaining time: [bold cyan]{task.fields[name]}'),
     TextColumn('{task.description}'),
-    TextColumn('Spent: [bold red]{task.fields[accumulated_cost]} [/bold red](limit: {task.fields[limit]})')
+    TextColumn('Spent: [bold red]{task.fields[accumulated_cost]} [/bold red](limit: ${task.fields[limit]:.2f})')
 )
 
 # Batch total progress bar
