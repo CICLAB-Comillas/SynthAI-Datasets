@@ -27,7 +27,7 @@ def random_category_params(params: Dict[str, Dict[str, str]], category: str) -> 
 def _generate_call_prompt(call_params: Dict[str, List[str]] = None) -> str:
     """ Returns a prompt to generate a call based on certain parameters """
 
-    return f"Generate a {call_params['Conversation']} phone call in which a client with phone number {call_params['Phone']} and address {call_params['Address']}, with a {call_params['Attitude']} attitude, contacts the supplying company {call_params['Company']} to report a problem with {call_params['Problem']}. Finally, the call is {call_params['Solved']} solved {call_params['Manner']}."
+    return f"Generate a {call_params['Conversation']} phone call in which a client with phone number {call_params['Phone']} and address {call_params['Address']}, with a {call_params['Attitude']} attitude, contacts the supplying company {call_params['Company']} to report a problem with {call_params['Problem']}. Finally, the call {call_params['Solved']} solved {call_params['Manner']}."
 
 def _generate_summary_prompt(summary_params: Dict[str, str] = None) -> str:
     """ Returns a prompt to generate a summary based on certain parameters """
