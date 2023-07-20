@@ -25,8 +25,7 @@ SynthAI-Datasets is a repository for synthetic dataset generation using OpenAI A
 
 Here is an example of how to create a dataset of 10 samples with *SynthAI-Dataset* by the only input of a few args.
 
-<video src="media/Demo.mp4" controls title="Title"></video>
-
+https://github.com/CICLAB-Comillas/SynthAI-Datasets/assets/59868153/7df8aebb-8b4a-4133-8d90-987e4ebd634c
 
 
 ## How to use ⏩
